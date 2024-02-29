@@ -1,8 +1,3 @@
-#!/usr/bin/env python
-# coding: utf-8
-
-
-# %% set up environment
 from lightning.pytorch.utilities.types import EVAL_DATALOADERS, TRAIN_DATALOADERS
 import numpy as np
 import matplotlib.pyplot as plt
@@ -33,6 +28,7 @@ from scipy.ndimage import map_coordinates
 from skimage.transform import AffineTransform, warp
 from utils.SurfaceDice import compute_dice_coefficient
 import imageio.v2 as iio
+from PIL import Image
 
 import tensorflow as tf
 import tensorboard as tb
@@ -99,6 +95,15 @@ def elastic_transform(image, alpha, sigma, random_state=None):
 
         # stack the transformed channels back into a single image
         return np.dstack(transformed_images)
+
+
+# show bounding box on image
+def show_box(box, ax):
+    x0, y0 = box[0], box[1]
+    w, h = box[2] - box[0], box[3] - box[1]
+    ax.add_patch(
+        plt.Rectangle((x0, y0), w, h, edgecolor="blue", facecolor=(0, 0, 0, 0), lw=2)
+    )
 
 
 # %% create a dataset class to load npz data and return back image embeddings and ground truth
@@ -276,7 +281,12 @@ class NpzTestDataset(Dataset):
                         mode="constant",
                         anti_aliasing=True,
                     )
+
+                    image_data_pre = np.rot90(image_data_pre, 3, (0, 1))
                     resized_image.append(image_data_pre)
+
+                # rotate to correct orientation
+                gt2D = np.rot90(gt2D, 3, (0, 1))
 
                 gts_array.append(gt2D)
                 # if (
@@ -326,7 +336,7 @@ class NpzTestDataset(Dataset):
 
 
 class MedsamModel(pl.LightningModule):
-    def __init__(self, roi, modalities, npz_tr_path, lr=1e-4):
+    def __init__(self, roi, modalities, npz_tr_path, png_save_path, lr=1e-4):
         super().__init__()
 
         self.npz_tr_path = npz_tr_path
@@ -356,6 +366,9 @@ class MedsamModel(pl.LightningModule):
         self.mask_decoder = self.sam_model.mask_decoder
         self.prompt_encoder = self.sam_model.prompt_encoder
         self.sam_trans = ResizeLongestSide(self.image_encoder.img_size)
+
+        # prepare png save path
+        self.png_save_path = png_save_path
 
         # hyperparameters
         self.learning_rate = lr
@@ -431,12 +444,15 @@ class MedsamModel(pl.LightningModule):
             image_embedding, sparse_embeddings, dense_embeddings, multimask_output=False
         )
 
-    def augment(self, img, gt):
+    def augment(self, img, gt, embedding):
         # convert to numpy array for image manipulation
         img_np = img.detach().cpu().numpy()
         gt_np = gt.detach().cpu().numpy()
 
-        if np.random.random() < 0.5:
+        is_rotate = np.random.random() < 0.5
+        is_elastic = np.random.random() < 0.5
+
+        if is_rotate:
             # Random rotation within -20 and +20 degrees
             angle = np.random.uniform(-20, 20)
             img_np = rotate(img_np, angle=angle, mode="reflect")
@@ -447,7 +463,7 @@ class MedsamModel(pl.LightningModule):
             img_np = np.flip(img_np, axis=self.flip_direction)
             gt_np = np.flip(gt_np, axis=self.flip_direction)
 
-        if np.random.random() < 0.5:
+        if is_elastic:
             # Apply elastic transform
             img_np = elastic_transform(img_np, alpha=self.alpha, sigma=self.sigma)
             gt_np = elastic_transform(gt_np, alpha=self.alpha, sigma=self.sigma)
@@ -476,9 +492,12 @@ class MedsamModel(pl.LightningModule):
         # ), "input image should be resized to 1024*1024"
         # with torch.no_grad():
         #     embedding = self.sam_model.image_encoder(input_image)[0]
-        embedding = self.compute_image_embedding(
-            torch.as_tensor(img_np, device=img.device)
-        )
+        if is_rotate or is_elastic:
+            new_embedding = self.compute_image_embedding(
+                torch.as_tensor(img_np, device=img.device)
+            )
+        else:  # if not augmented at all, we can just use the original embedding
+            new_embedding = embedding
 
         # save an example image for sanity check
         bd = segmentation.find_boundaries(gt_np, mode="inner")
@@ -525,7 +544,7 @@ class MedsamModel(pl.LightningModule):
 
         return (
             torch.as_tensor(img_np, device=img.device),
-            embedding,
+            new_embedding,
             torch.as_tensor(gt_np, device=gt.device),
             box,
         )
@@ -546,7 +565,7 @@ class MedsamModel(pl.LightningModule):
             is_augmented = True  # always augment data
             if is_augmented:
                 image, image_embedding, gt2D, box = self.augment(
-                    image, gt2D
+                    image, gt2D, image_embeddings[index]
                 )  # now augment has Tensor input and Tensor output, Michael
 
             else:
@@ -686,7 +705,7 @@ class MedsamModel(pl.LightningModule):
             gt2D = gt2Ds[index]
             bbox = bboxs[index]
 
-            image_embedding = self.compute_image_embedding(img)
+            # image_embedding = self.compute_image_embedding(img)
             # resize_img = self.sam_trans.apply_image(img_np)
             # resize_img_tensor = torch.from_numpy(resize_img.transpose(2, 0, 1)).to(img)
             # input_image = self.sam_model.preprocess(
@@ -698,76 +717,88 @@ class MedsamModel(pl.LightningModule):
             #     image_embedding = self.sam_model.image_encoder(
             #         input_image
             #     )  # (1, 256, 64, 64)
-            with torch.no_grad():
-                # compute mask and apply sigmoid to convert model output to probabilities
-                medsam_seg_prob = torch.sigmoid(self(image_embedding, gt2D, bbox))
+            # with torch.no_grad():
+            #     # compute mask and apply sigmoid to convert model output to probabilities
+            #     medsam_seg_prob = torch.sigmoid(self(image_embedding, gt2D, bbox))
 
-                medsam_seg_prob = medsam_seg_prob.cpu().numpy().squeeze()
-                # print("Mask threshold:", self.sam_model.mask_threshold)
-                medsam_seg = medsam_seg_prob > 0.5
+            #     medsam_seg_prob = medsam_seg_prob.cpu().numpy().squeeze()
+            #     # print("Mask threshold:", self.sam_model.mask_threshold)
+            #     medsam_seg = medsam_seg_prob > 0.5
 
-                # calculate DSC
-                gt2D = gt2D.detach().cpu().numpy()
-                dice_score = compute_dice_coefficient(gt2D, medsam_seg)
-                self.dice_scores.append(dice_score)
-                dsc += dice_score
+            #     # calculate DSC
+            #     gt2D = gt2D.detach().cpu().numpy()
+            #     dice_score = compute_dice_coefficient(gt2D, medsam_seg)
+            #     self.dice_scores.append(dice_score)
+            #     dsc += dice_score
 
-                # calculate HD95
-                hausdorff_distance = monai.metrics.compute_hausdorff_distance(
-                    medsam_seg[None, None, :, :],
-                    gt2D[None, None, :, :],
-                    include_background=True,
-                    percentile=95,
-                ).item()
-                self.hausdorff_distances.append(hausdorff_distance)
-                hd95 += hausdorff_distance
+            #     # calculate HD95
+            #     hausdorff_distance = monai.metrics.compute_hausdorff_distance(
+            #         medsam_seg[None, None, :, :],
+            #         gt2D[None, None, :, :],
+            #         include_background=True,
+            #         percentile=95,
+            #     ).item()
+            #     self.hausdorff_distances.append(hausdorff_distance)
+            #     hd95 += hausdorff_distance
 
-                # save an image of the ground truth mask and predicted mask
-                img_idx = imgs.detach().cpu().numpy()[0, :, :]
-                gt_idx = gt2Ds.detach().cpu().numpy()[0, :, :]
-                pred_idx = medsam_seg
+            # save an image of the ground truth mask and predicted mask
+            img_idx = img
+            # gt_idx = gt2Ds.detach().cpu().numpy()[0, :, :]
+            # pred_idx = medsam_seg
 
-                img_idx //= 2
+            # img_idx //= 2
 
-                tp = np.logical_and(pred_idx, gt_idx)
-                fn = np.logical_and(np.logical_not(pred_idx), gt_idx)
-                fp = np.logical_and(pred_idx, np.logical_not(gt_idx))
+            # tp = np.logical_and(pred_idx, gt_idx)
+            # fn = np.logical_and(np.logical_not(pred_idx), gt_idx)
+            # fp = np.logical_and(pred_idx, np.logical_not(gt_idx))
 
-                gt_border = segmentation.find_boundaries(gt_idx, mode="inner")
+            # gt_border = segmentation.find_boundaries(gt_idx, mode="inner")
 
-                img_idx[tp, :] = [0, 255, 0]  # this makes true positives green
-                img_idx[fn, :] = [255, 192, 203]  # mark the false negatives with pink
-                img_idx[fp, :] = [255, 255, 0]  # mark false positives with yellow
-                img_idx[gt_border, :] = [
-                    255,
-                    0,
-                    0,
-                ]  # mark the ground truth border with red
+            # img_idx[tp, :] = [0, 255, 0]  # this makes true positives green
+            # img_idx[fn, :] = [255, 192, 203]  # mark the false negatives with pink
+            # img_idx[fp, :] = [255, 255, 0]  # mark false positives with yellow
+            # img_idx[gt_border, :] = [
+            #     255,
+            #     0,
+            #     0,
+            # ]  # mark the ground truth border with red
 
-                # add DSC score to image
-                fig, axs = plt.subplots(
-                    1,
-                    1,
+            # # add DSC score to image
+            # fig, axs = plt.subplots(
+            #     1,
+            #     1,
+            # )
+            # axs.axis("off")
+            # plt.subplots_adjust(left=0, bottom=0, right=1, top=1)
+            # axs.imshow(img_idx.astype(np.uint8))
+            # axs.text(
+            #     1, 10, f"DSC: {100*dice_score:5.2f}", fontsize=16, color="white"
+            # )
+
+            # # show_box(bbox.detach().cpu().numpy(), axs)
+
+            # fig.tight_layout()
+            # plt.savefig(
+            #     os.path.join(
+            #         self.png_save_path,
+            #         f"img-{100*dice_score:2.0f}-" + str(batch_idx) + ".png",
+            #     ),
+            #     bbox_inches="tight",
+            #     dpi=300,
+            # )
+            # plt.close()
+            im = Image.fromarray(img_idx.detach().cpu().numpy().astype(np.uint8))
+            im.save(
+                join(
+                    self.png_save_path,
+                    "BRATS_" + str(batch_idx).zfill(4) + "_0000.png",
                 )
-                plt.subplots_adjust(left=0, bottom=0, right=1, top=1)
-                axs.imshow(img_idx.astype(np.uint8))
-                axs.text(
-                    1, 10, f"DSC: {100*dice_score:5.2f}", fontsize=16, color="white"
-                )
-                axs.axis("off")
-
-                fig.tight_layout()
-                plt.savefig(
-                    "/home/mohammad/MedSAM/models/MedSAM Lightning/flair-t1gd-t2w/test.png",
-                    bbox_inches="tight",
-                    dpi=300,
-                )
-                plt.close()
-                # io.imsave(
-                #     "/home/mohammad/MedSAM/models/MedSAM Lightning/flair-t1gd-t2w/test.png",
-                #     img_idx.astype(np.uint8),
-                #     check_contrast=False,
-                # )
+            )
+            # io.imsave(
+            #     "/home/mohammad/MedSAM/models/MedSAM Lightning/flair-t1gd-t2w/test.png",
+            #     img_idx.astype(np.uint8),
+            #     check_contrast=False,
+            # )
 
         # take average DSC for the batch, set batch size to 1 if you want the average over all images
 
@@ -904,32 +935,33 @@ if __name__ == "__main__":
     # the train data only contains flair, t1gd, t2w in that order
 
     # fmt: on
-    roi = rois_dict["enhancing"]
-    #roi = "whole"
+    roi = rois_dict["non-enhancing"]
+    # roi = "whole"
     # modalities = [
     #     modalities_dict["flair"],
     #     modalities_dict["t1gd"],
     #     modalities_dict["t2w"],
     # ]
-    modalities = [modalities_dict["t1gd"]]
+    modalities = [modalities_dict["flair"]]
 
     medsam_model = MedsamModel(
         roi=roi,
-        modalities=[0,1,2],
-        npz_tr_path="/home/mohammad/MedSAM/data/Npz_files_PCA/4-modalities_/train",
+        modalities=modalities,
+        npz_tr_path="/home/mohammad/MedSAM/data/Npz_files_three_modalities/flair-t1gd-t2w_/train",
+        png_save_path="/home/mohammad/MedSAM/models/MedSAM Lightning",
     )
     # medsam_model.learning_rate = 1e-4
 
     # %% setup the model
 
-    num_epochs = 20
+    num_epochs = 30
 
     swa = pl.callbacks.StochasticWeightAveraging(
         swa_lrs=1e-4, swa_epoch_start=0.8, annealing_strategy="cos"
     )
 
     checkpoint_callback = pl.callbacks.ModelCheckpoint(
-        dirpath="/home/mohammad/MedSAM/models/PCA/enhancing",
+        dirpath="/home/mohammad/MedSAM/models/MedSAM Lightning/flair/non-enhancing/checkpoints",
         save_top_k=1,
         monitor="train_loss",
         mode="min",
@@ -940,9 +972,9 @@ if __name__ == "__main__":
     # tensorboard logger
 
     logger = TensorBoardLogger(
-        "/home/mohammad/MedSAM/models/PCA/enhancing",
+        "/home/mohammad/MedSAM/models/MedSAM Lightning/flair/non-enhancing",
         log_graph=False,
-        version="PCA",
+        version="augment",
     )
 
     # learning rate finder
@@ -958,7 +990,7 @@ if __name__ == "__main__":
         max_epochs=num_epochs,
         devices=[1],
         strategy="ddp_find_unused_parameters_true",
-        callbacks=[swa, checkpoint_callback, learning_rate_finder],
+        callbacks=[checkpoint_callback, learning_rate_finder, swa],
         logger=logger,
     )
 

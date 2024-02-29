@@ -1,3 +1,4 @@
+# depending on the modalities/ROI needed the code can be changed
 import numpy as np
 import SimpleITK as sitk
 import os
